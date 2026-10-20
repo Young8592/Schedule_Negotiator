@@ -1,0 +1,23 @@
+# Paid hosting example. Review current service and disk costs before deploying.
+services:
+  - type: web
+    name: schedule-negotiator
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python start_server.py
+    plan: starter
+    numInstances: 1
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.14"
+      - key: SCHEDULE_DB
+        value: /var/data/schedule.db
+      - key: SCHEDULE_ENABLE_DEMO
+        value: "0"
+      - key: STREAMLIT_SERVER_COOKIE_SECRET
+        generateValue: true
+    disk:
+      name: schedule-data
+      mountPath: /var/data
+      sizeGB: 1
