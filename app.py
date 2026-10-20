@@ -17,7 +17,13 @@ ROOT = Path(__file__).resolve().parent
 def get_store(path):
     return Store(path)
 
-store = get_store(os.environ.get("SCHEDULE_DB", str(ROOT / "data" / "schedule.db")))
+database_url = os.environ.get("DATABASE_URL", "")
+if not database_url:
+    try:
+        database_url = st.secrets.get("DATABASE_URL", "")
+    except FileNotFoundError:
+        database_url = ""
+store = get_store(database_url or os.environ.get("SCHEDULE_DB", str(ROOT / "data" / "schedule.db")))
 store.delete_expired_meetings()
 
 st.markdown("""<style>
