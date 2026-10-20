@@ -20,6 +20,17 @@ JOIN_CODE_DIGITS = "23456789"
 JOIN_CODE_ALPHABET = JOIN_CODE_LETTERS + JOIN_CODE_DIGITS
 
 
+class _PostgresConnection:
+    """Small compatibility layer so the storage logic can use SQLite-style placeholders."""
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, sql, params=()):
+        if sql.strip().upper() == "BEGIN IMMEDIATE":
+            return self.connection.cursor()
+        return self.connection.execute(sql.replace("?", "%s"), params)
+
+
 def generate_join_code():
     """Return a readable five-character code containing letters and digits."""
     while True:
@@ -161,8 +172,40 @@ def parse_local(raw: str, meeting, default_priority=1):
 
 class Store:
     def __init__(self, path):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.database_url = str(path) if str(path).startswith(("postgres://", "postgresql://")) else ""
+        self.path = None if self.database_url else Path(path)
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.integrity_errors = (sqlite3.IntegrityError,)
+        else:
+            import psycopg
+            self.psycopg = psycopg
+            self.integrity_errors = (psycopg.IntegrityError,)
+        if self.database_url:
+            with self.db() as con:
+                statements = [
+                    '''CREATE TABLE IF NOT EXISTS meetings (
+                      id TEXT PRIMARY KEY, join_code TEXT UNIQUE NOT NULL, title TEXT NOT NULL,
+                      start_date TEXT NOT NULL, end_date TEXT NOT NULL, duration INTEGER NOT NULL,
+                      location TEXT NOT NULL DEFAULT '', expected_people INTEGER NOT NULL DEFAULT 2,
+                      host_code_hash TEXT NOT NULL DEFAULT '')''',
+                    '''CREATE TABLE IF NOT EXISTS people (
+                      id TEXT PRIMARY KEY, meeting_id TEXT REFERENCES meetings(id), name TEXT NOT NULL,
+                      token_hash TEXT UNIQUE NOT NULL, host INTEGER NOT NULL DEFAULT 0,
+                      required INTEGER NOT NULL DEFAULT 0, submitted INTEGER NOT NULL DEFAULT 0,
+                      access_code_hash TEXT NOT NULL DEFAULT '', UNIQUE(meeting_id, name))''',
+                    '''CREATE TABLE IF NOT EXISTS events (
+                      id TEXT PRIMARY KEY, person_id TEXT REFERENCES people(id), title TEXT NOT NULL,
+                      start TEXT NOT NULL, "end" TEXT NOT NULL,
+                      priority INTEGER NOT NULL CHECK(priority IN (1,2,3)), public INTEGER NOT NULL DEFAULT 0)''',
+                    "CREATE INDEX IF NOT EXISTS events_person ON events(person_id)",
+                    "CREATE INDEX IF NOT EXISTS people_meeting ON people(meeting_id)",
+                    '''CREATE TABLE IF NOT EXISTS auth_attempts (
+                      bucket TEXT PRIMARY KEY, started DOUBLE PRECISION NOT NULL, count INTEGER NOT NULL)''',
+                ]
+                for statement in statements:
+                    con.execute(statement)
+            return
         with self.db() as con:
             con.executescript('''
                 CREATE TABLE IF NOT EXISTS meetings (
@@ -178,7 +221,7 @@ class Store:
                   UNIQUE(meeting_id, name));
                 CREATE TABLE IF NOT EXISTS events (
                   id TEXT PRIMARY KEY, person_id TEXT REFERENCES people(id), title TEXT NOT NULL,
-                  start TEXT NOT NULL, end TEXT NOT NULL, priority INTEGER NOT NULL CHECK(priority IN (1,2,3)),
+                  start TEXT NOT NULL, "end" TEXT NOT NULL, priority INTEGER NOT NULL CHECK(priority IN (1,2,3)),
                   public INTEGER NOT NULL DEFAULT 0);
                 CREATE INDEX IF NOT EXISTS events_person ON events(person_id);
                 CREATE INDEX IF NOT EXISTS people_meeting ON people(meeting_id);
@@ -200,6 +243,15 @@ class Store:
 
     @contextmanager
     def db(self):
+        if self.database_url:
+            from psycopg.rows import dict_row
+            con = self.psycopg.connect(self.database_url, row_factory=dict_row, connect_timeout=10)
+            try:
+                with con:
+                    yield _PostgresConnection(con)
+            finally:
+                con.close()
+            return
         con = sqlite3.connect(self.path, timeout=10)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys=ON")
@@ -226,7 +278,8 @@ class Store:
                     raise ValueError(f"입력 시도가 너무 많습니다. {seconds}초 후 다시 시도해 주세요.")
                 con.execute("UPDATE auth_attempts SET count=count+1 WHERE bucket=?", (bucket,))
             else:
-                con.execute("INSERT OR REPLACE INTO auth_attempts VALUES (?,?,1)", (bucket, now))
+                con.execute('''INSERT INTO auth_attempts (bucket,started,count) VALUES (?,?,1)
+                    ON CONFLICT(bucket) DO UPDATE SET started=excluded.started,count=1''', (bucket, now))
 
     def clear_attempts(self, bucket):
         with self.db() as con:
@@ -371,13 +424,13 @@ class Store:
             raise ValueError("모임 초대 코드를 확인해 주세요.")
         with self.db() as con:
             con.execute("BEGIN IMMEDIATE")
-            if con.execute("SELECT COUNT(*) FROM people WHERE meeting_id=?", (m["id"],)).fetchone()[0] >= m["expected_people"]:
+            if con.execute("SELECT COUNT(*) AS count FROM people WHERE meeting_id=?", (m["id"],)).fetchone()["count"] >= m["expected_people"]:
                 raise ValueError("설정한 모임 인원이 모두 참여했습니다.")
             token = secrets.token_urlsafe(24)
             access_code = self.unique_access_code(con)
             try:
                 con.execute("INSERT INTO people (id,meeting_id,name,token_hash,host,required,submitted,access_code_hash) VALUES (?,?,?,?,?,?,?,?)", (secrets.token_hex(12), m["id"], name, self.digest(token), 0, 0, 0, self.digest(access_code)))
-            except sqlite3.IntegrityError:
+            except self.integrity_errors:
                 raise ValueError("같은 이름이 이미 있습니다. 다른 이름을 쓰거나 개인 접속 코드로 돌아와 주세요.") from None
         return (token, access_code) if return_access else token
 
@@ -387,7 +440,7 @@ class Store:
             m = dict(con.execute("SELECT id,join_code,title,start_date,end_date,duration,location,expected_people FROM meetings WHERE id=?", (actor["meeting_id"],)).fetchone())
             people = [dict(r) for r in con.execute("SELECT id,name,host,required,submitted FROM people WHERE meeting_id=? ORDER BY host DESC,name", (m["id"],))]
             # Mask in SQL: private titles belonging to others never enter the UI payload.
-            events = [dict(r) for r in con.execute('''SELECT e.id,e.person_id,p.name,e.start,e.end,e.priority,e.public,
+            events = [dict(r) for r in con.execute('''SELECT e.id,e.person_id,p.name,e.start,e."end" AS end,e.priority,e.public,
                 CASE WHEN e.person_id=? OR e.public=1 THEN e.title ELSE '바쁨' END AS title
                 FROM events e JOIN people p ON p.id=e.person_id WHERE p.meeting_id=? ORDER BY e.start''',
                 (actor["id"], m["id"]))]
@@ -400,13 +453,13 @@ class Store:
         with self.db() as con:
             con.execute("BEGIN IMMEDIATE")
             actor = self.actor(con, token)
-            count = con.execute("SELECT COUNT(*) FROM events WHERE person_id=?", (actor["id"],)).fetchone()[0]
+            count = con.execute("SELECT COUNT(*) AS count FROM events WHERE person_id=?", (actor["id"],)).fetchone()["count"]
             if count + len(events) > 300:
                 raise ValueError("한 사람당 최대 300개의 일정을 저장할 수 있습니다.")
             m = dict(con.execute("SELECT * FROM meetings WHERE id=?", (actor["meeting_id"],)).fetchone())
             valid = [validate_event(e, m) for e in events]
             for e in valid:
-                duplicate = con.execute("SELECT id FROM events WHERE person_id=? AND start=? AND end=? AND title=?", (actor["id"], e["start"], e["end"], e["title"])).fetchone()
+                duplicate = con.execute("SELECT id FROM events WHERE person_id=? AND start=? AND \"end\"=? AND title=?", (actor["id"], e["start"], e["end"], e["title"])).fetchone()
                 if duplicate:
                     raise ValueError("이미 저장한 일정이 포함되어 있습니다. 중복 행을 제거해 주세요.")
                 con.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?)", (secrets.token_hex(12), actor["id"], e["title"], e["start"], e["end"], e["priority"], int(e["public"])))
