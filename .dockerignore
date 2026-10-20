@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!app.py
+!core.py
+!start_server.py
+!requirements.txt
+!.streamlit
+!.streamlit/config.toml
