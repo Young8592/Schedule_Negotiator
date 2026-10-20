@@ -15,9 +15,26 @@
 공개 앱으로 배포하면 누구나 첫 화면에 접속할 수 있고, 각 모임에는 영문 대문자와 숫자가 섞인 5자리 초대 코드가 발급됩니다.
 내 모임을 만든 뒤 사이드바의 초대 링크 또는 코드를 참여자에게 공유하세요. 별도 입장 비밀번호는 없습니다.
 
-**무료 체험의 저장 한계:** 현재 앱은 SQLite 파일에 일정을 저장합니다. Community Cloud의 로컬 파일을 영구 보관소로 사용하지 마세요. 서버 재생성 등의 상황에서 데이터가 사라질 수 있으므로 중요한 실제 일정을 장기 보관하려면 아래 방식이 필요합니다. 무료 앱은 오랫동안 방문이 없으면 잠들 수 있고, 다음 방문 때 깨어나는 시간이 걸립니다.
+**무료 체험의 저장 한계:** `DATABASE_URL`을 설정하지 않으면 앱은 SQLite 파일에 일정을 저장합니다. Community Cloud의 로컬 파일은 서버 재생성 시 사라질 수 있습니다. 아래의 무료 Supabase 연결을 설정하면 모임과 개인 접속 코드를 외부 PostgreSQL에 보관할 수 있습니다.
 
 공식 안내: [배포와 주소 설정](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy), [GitHub 연결](https://docs.streamlit.io/deploy/streamlit-community-cloud/get-started/connect-your-github-account)
+
+## 무료 배포에서 데이터를 유지하기: Supabase
+
+1. Supabase에서 무료 프로젝트를 만들고 데이터베이스 비밀번호를 안전하게 보관합니다.
+2. 프로젝트 상단 **Connect**에서 **Session pooler** 연결 문자열을 복사합니다. Streamlit Cloud에서 IPv4로 접속할 수 있도록 포트 5432의 Session pooler를 사용합니다.
+3. 문자열의 `[YOUR-PASSWORD]`를 실제 DB 비밀번호로 바꿉니다. 특수문자가 있으면 URL 인코딩합니다.
+4. Streamlit Community Cloud의 앱에서 **Settings → Secrets**를 엽니다.
+5. 아래 형식으로 저장합니다. 실제 문자열은 GitHub나 채팅에 올리지 않습니다.
+
+```toml
+DATABASE_URL = "postgresql://postgres.프로젝트참조:DB비밀번호@풀러주소:5432/postgres?sslmode=require"
+```
+
+6. 앱을 재부팅합니다. 첫 연결 때 필요한 테이블이 자동 생성됩니다.
+7. 새 테스트 모임을 만들고 나간 뒤 개인 접속 코드로 다시 들어가 정상 동작을 확인합니다.
+
+SQLite에 이미 만들었던 모임은 Supabase로 자동 이전되지 않으므로 외부 DB 연결 후 새로 생성해야 합니다. Supabase 무료 프로젝트는 장기간 사용하지 않으면 일시 정지될 수 있으며, 대시보드에서 다시 시작할 수 있습니다.
 
 ## 일정을 보관하며 운영하기: Render + 영구 디스크
 
